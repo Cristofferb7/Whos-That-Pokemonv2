@@ -16,6 +16,14 @@ interface Message {
   text: string;
 }
 
+interface Candidate {
+  name: string;
+  slug: string;
+  sprite: string;
+  types: string[];
+  id: number;
+}
+
 interface Match {
   pokemon: PokemonData;
   confidence: number;
@@ -28,8 +36,8 @@ interface Props {
 
 const STARTERS = [
   'Small yellow mouse with red cheeks',
-  'Big fire-breathing dragon',
-  'Purple ghost with big hands',
+  'Big purple ghost with huge hands',
+  'Fire-breathing orange dragon',
 ];
 
 export function ChatScreen({ onBack, onView }: Props) {
@@ -39,11 +47,12 @@ export function ChatScreen({ onBack, onView }: Props) {
   const [input, setInput] = useState('');
   const [thinking, setThinking] = useState(false);
   const [match, setMatch] = useState<Match | null>(null);
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, thinking, match]);
+  }, [messages, thinking, match, candidate]);
 
   async function send(text: string) {
     if (!text.trim() || thinking) return;
@@ -51,6 +60,7 @@ export function ChatScreen({ onBack, onView }: Props) {
     setMessages(next);
     setInput('');
     setThinking(true);
+    setCandidate(null);
 
     try {
       const res = await fetch('/api/chat', {
@@ -59,30 +69,63 @@ export function ChatScreen({ onBack, onView }: Props) {
         body: JSON.stringify({ messages: next }),
       });
       const data = await res.json();
+      if (res.status === 429) throw new Error('rate_limit');
       if (!res.ok) throw new Error(data.error || 'API error');
 
       const parsed = parseJson(data.text);
       const reply = parsed?.message ?? "Tell me more — what color is it, and is it big or small?";
       setMessages((m) => [...m, { role: 'assistant', text: reply }]);
 
+      // Full match — fetch and show result card
       if (parsed?.action === 'match' && parsed?.match_name) {
         try {
           const pokemon = await fetchPokemon(parsed.match_name);
           setMatch({ pokemon, confidence: parsed.confidence ?? 80 });
-        } catch {
-          // silently ignore — Claude might have slightly wrong name
-        }
+        } catch { /* silently ignore bad name */ }
       }
-    } catch {
-      setMessages((m) => [...m, { role: 'assistant', text: "Sorry, lost signal for a second. Could you say that again?" }]);
+      // Candidate hint — fetch sprite + types for the "Is this it?" card
+      else if (parsed?.candidate_name) {
+        try {
+          const pokemon = await fetchPokemon(parsed.candidate_name);
+          setCandidate({
+            name: pokemon.name,
+            slug: pokemon.slug,
+            sprite: pokemon.sprite,
+            types: pokemon.types,
+            id: pokemon.id,
+          });
+        } catch { /* ignore if candidate name is invalid */ }
+      }
+    } catch (e: unknown) {
+      const isRateLimit = e instanceof Error && e.message === 'rate_limit';
+      setMessages((m) => [...m, {
+        role: 'assistant',
+        text: isRateLimit
+          ? "You've hit Gemini's free tier limit. Wait a few seconds and try again!"
+          : "Sorry, lost signal for a second. Could you say that again?",
+      }]);
     } finally {
       setThinking(false);
     }
   }
 
+  function confirmCandidate() {
+    if (!candidate) return;
+    fetchPokemon(candidate.slug).then((p) => {
+      setCandidate(null);
+      onView(p);
+    }).catch(() => {});
+  }
+
+  function denyCandidate() {
+    setCandidate(null);
+    send(`No, it's not ${candidate?.name}. Let me describe more.`);
+  }
+
   function reset() {
     setMessages([{ role: 'assistant', text: "Hi! Describe a Pokémon and I'll help you identify it. What does it look like?" }]);
     setMatch(null);
+    setCandidate(null);
     setInput('');
   }
 
@@ -111,7 +154,19 @@ export function ChatScreen({ onBack, onView }: Props) {
       {/* Messages */}
       <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: '16px 16px 8px', display: 'flex', flexDirection: 'column', gap: 10 }}>
         {messages.map((m, i) => <Bubble key={i} role={m.role} text={m.text} />)}
+
         {thinking && <ThinkingBubble />}
+
+        {/* Candidate hint card */}
+        {!thinking && candidate && !match && (
+          <CandidateHint
+            candidate={candidate}
+            onConfirm={confirmCandidate}
+            onDeny={denyCandidate}
+          />
+        )}
+
+        {/* Final match card */}
         {match && (
           <MatchCard
             pokemon={match.pokemon}
@@ -120,6 +175,7 @@ export function ChatScreen({ onBack, onView }: Props) {
             onReset={reset}
           />
         )}
+
         {showStarters && (
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
             {STARTERS.map((s) => (
@@ -166,6 +222,140 @@ export function ChatScreen({ onBack, onView }: Props) {
   );
 }
 
+// ─── Candidate hint card ────────────────────────────────────────────────────
+
+function CandidateHint({ candidate, onConfirm, onDeny }: {
+  candidate: Candidate;
+  onConfirm: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <div style={{
+      background: C.white, border: `1px solid ${C.border}`,
+      borderRadius: 20, padding: 14, marginTop: 4,
+      boxShadow: '0 4px 16px rgba(0,0,0,0.07)',
+    }}>
+      {/* Label */}
+      <div style={{
+        fontSize: 11, fontWeight: 700, color: C.inkSoft,
+        letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 10,
+      }}>
+        Am I thinking of this one?
+      </div>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        {/* Sprite */}
+        <div style={{
+          width: 90, height: 90, borderRadius: 16, background: '#F1ECE8',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexShrink: 0, overflow: 'hidden',
+        }}>
+          {candidate.sprite && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={candidate.sprite} alt={candidate.name} style={{ width: 82, height: 82, objectFit: 'contain' }} />
+          )}
+        </div>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: C.inkSoft, letterSpacing: 0.6 }}>
+            #{String(candidate.id).padStart(3, '0')}
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.ink, letterSpacing: -0.5, marginTop: 2 }}>
+            {candidate.name}
+          </div>
+          <div style={{ display: 'flex', gap: 4, marginTop: 6 }}>
+            {candidate.types.map((t) => <TypeBadge key={t} type={t} size="sm" />)}
+          </div>
+        </div>
+      </div>
+
+      {/* Buttons */}
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <button onClick={onConfirm} style={{
+          all: 'unset', cursor: 'pointer', flex: 1,
+          background: C.red, color: '#fff',
+          padding: '11px', borderRadius: 12,
+          fontSize: 14, fontWeight: 700, textAlign: 'center',
+          boxShadow: '0 4px 12px rgba(230,57,70,0.28)',
+        }}>
+          Yes, that&apos;s it!
+        </button>
+        <button onClick={onDeny} style={{
+          all: 'unset', cursor: 'pointer', flex: 1,
+          background: '#F1ECE8', color: C.ink,
+          padding: '11px', borderRadius: 12,
+          fontSize: 14, fontWeight: 600, textAlign: 'center',
+        }}>
+          Nope, keep going
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Final match card ───────────────────────────────────────────────────────
+
+function MatchCard({ pokemon, confidence, onView, onReset }: {
+  pokemon: PokemonData; confidence: number;
+  onView: () => void; onReset: () => void;
+}) {
+  return (
+    <div style={{
+      marginTop: 6, background: C.white,
+      border: `2px solid ${C.red}`, borderRadius: 20,
+      padding: 14, position: 'relative',
+      boxShadow: '0 10px 28px rgba(230,57,70,0.18)',
+    }}>
+      <div style={{
+        position: 'absolute', top: -10, left: 14,
+        background: C.red, color: '#fff',
+        fontSize: 10, fontWeight: 800, letterSpacing: 1.5,
+        padding: '3px 8px', borderRadius: 6,
+      }}>MATCH · {confidence}%</div>
+
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+        <div style={{
+          width: 80, height: 80, borderRadius: 16, background: '#F1ECE8',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexShrink: 0, overflow: 'hidden',
+        }}>
+          {pokemon.sprite && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={pokemon.sprite} alt={pokemon.name} style={{ width: 72, height: 72, objectFit: 'contain' }} />
+          )}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: C.inkSoft, letterSpacing: 0.6 }}>
+            #{String(pokemon.id).padStart(3, '0')}
+          </div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: C.ink, letterSpacing: -0.5 }}>{pokemon.name}</div>
+          <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+            {pokemon.types.map((t) => <TypeBadge key={t} type={t} size="sm" />)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+        <button onClick={onView} style={{
+          all: 'unset', cursor: 'pointer', flex: 1,
+          background: C.red, color: '#fff',
+          padding: '12px 16px', borderRadius: 14,
+          fontSize: 15, fontWeight: 700, textAlign: 'center',
+          boxShadow: '0 4px 12px rgba(230,57,70,0.3), inset 0 -2px 0 rgba(0,0,0,0.12)',
+        }}>View full details</button>
+        <button onClick={onReset} style={{
+          all: 'unset', cursor: 'pointer',
+          background: '#F1ECE8', color: C.ink,
+          padding: '12px 16px', borderRadius: 14,
+          fontSize: 15, fontWeight: 600, textAlign: 'center',
+        }}>Try another</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Chat bubbles ───────────────────────────────────────────────────────────
+
 function Bubble({ role, text }: { role: 'user' | 'assistant'; text: string }) {
   const isUser = role === 'user';
   return (
@@ -207,64 +397,7 @@ function ThinkingBubble() {
   );
 }
 
-function MatchCard({ pokemon, confidence, onView, onReset }: {
-  pokemon: PokemonData; confidence: number;
-  onView: () => void; onReset: () => void;
-}) {
-  return (
-    <div style={{
-      marginTop: 6, background: C.white,
-      border: `2px solid ${C.red}`, borderRadius: 20,
-      padding: 14, position: 'relative',
-      boxShadow: '0 10px 28px rgba(230,57,70,0.18)',
-    }}>
-      <div style={{
-        position: 'absolute', top: -10, left: 14,
-        background: C.red, color: '#fff',
-        fontSize: 10, fontWeight: 800, letterSpacing: 1.5,
-        padding: '3px 8px', borderRadius: 6,
-      }}>MATCH · {confidence}%</div>
-
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-        <div style={{
-          width: 72, height: 72, borderRadius: 16, background: '#F1ECE8',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          flexShrink: 0, overflow: 'hidden',
-        }}>
-          {pokemon.sprite && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img src={pokemon.sprite} alt={pokemon.name} style={{ width: 68, height: 68, objectFit: 'contain' }} />
-          )}
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontFamily: 'monospace', fontSize: 11, color: C.inkSoft, letterSpacing: 0.6 }}>
-            #{String(pokemon.id).padStart(3, '0')}
-          </div>
-          <div style={{ fontSize: 20, fontWeight: 800, color: C.ink, letterSpacing: -0.5 }}>{pokemon.name}</div>
-          <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
-            {pokemon.types.map((t) => <TypeBadge key={t} type={t} size="sm" />)}
-          </div>
-        </div>
-      </div>
-
-      <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-        <button onClick={onView} style={{
-          all: 'unset', cursor: 'pointer', flex: 1,
-          background: C.red, color: '#fff',
-          padding: '12px 16px', borderRadius: 14,
-          fontSize: 15, fontWeight: 700, textAlign: 'center',
-          boxShadow: '0 4px 12px rgba(230,57,70,0.3), inset 0 -2px 0 rgba(0,0,0,0.12)',
-        }}>View full details</button>
-        <button onClick={onReset} style={{
-          all: 'unset', cursor: 'pointer',
-          background: '#F1ECE8', color: C.ink,
-          padding: '12px 16px', borderRadius: 14,
-          fontSize: 15, fontWeight: 600, textAlign: 'center',
-        }}>Try another</button>
-      </div>
-    </div>
-  );
-}
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
 function parseJson(raw: string) {
   if (!raw) return null;

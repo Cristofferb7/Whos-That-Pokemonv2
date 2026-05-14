@@ -15,7 +15,34 @@ interface Props {
   onResult: (pokemon: PokemonData) => void;
 }
 
-type Status = 'idle' | 'analyzing' | 'fetching' | 'error';
+type Status = 'idle' | 'compressing' | 'analyzing' | 'fetching' | 'error';
+
+// Resize + compress image to JPEG ≤ 1024px, well under Vercel's 4.5MB limit
+function compressImage(file: File, maxPx = 1024, quality = 0.85): Promise<File> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width, height } = img;
+      if (width > maxPx || height > maxPx) {
+        if (width > height) { height = Math.round(height * maxPx / width); width = maxPx; }
+        else { width = Math.round(width * maxPx / height); height = maxPx; }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d')!.drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => resolve(blob ? new File([blob], 'photo.jpg', { type: 'image/jpeg' }) : file),
+        'image/jpeg',
+        quality
+      );
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
 
 export function PhotoScreen({ onBack, onResult }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -24,26 +51,33 @@ export function PhotoScreen({ onBack, onResult }: Props) {
   const [errorMsg, setErrorMsg] = useState('');
 
   async function handleFile(file: File) {
-    // Show preview
+    setStatus('compressing');
+    setErrorMsg('');
+
+    // Show original as preview immediately
     const reader = new FileReader();
     reader.onload = (e) => setPreview(e.target?.result as string);
     reader.readAsDataURL(file);
 
-    setStatus('analyzing');
-    setErrorMsg('');
-
     try {
-      // 1. Ask Claude to identify the Pokemon
+      // 1. Compress client-side
+      const compressed = await compressImage(file);
+
+      // 2. Ask Gemini Vision to identify
+      setStatus('analyzing');
       const form = new FormData();
-      form.append('image', file);
+      form.append('image', compressed);
       const idRes = await fetch('/api/identify', { method: 'POST', body: form });
       const idData = await idRes.json();
 
-      if (!idRes.ok || !idData.name || idData.name.toLowerCase() === 'unknown') {
-        throw new Error("Couldn't identify a Pokémon in that image. Try a clearer photo.");
+      if (!idRes.ok) {
+        throw new Error(idData.error || `Server error ${idRes.status}`);
+      }
+      if (!idData.name || idData.name.toLowerCase() === 'unknown') {
+        throw new Error("No Pokémon found in that image. Try a clearer photo or official artwork.");
       }
 
-      // 2. Fetch full data from PokeAPI
+      // 3. Fetch full Pokémon data
       setStatus('fetching');
       const pokemon = await fetchPokemon(idData.name);
       onResult(pokemon);
@@ -53,13 +87,21 @@ export function PhotoScreen({ onBack, onResult }: Props) {
     }
   }
 
-  const busy = status === 'analyzing' || status === 'fetching';
+  const busy = status === 'compressing' || status === 'analyzing' || status === 'fetching';
+
+  const statusLabel: Record<Status, string> = {
+    idle: '',
+    compressing: 'Compressing image…',
+    analyzing: 'Analyzing with Gemini…',
+    fetching: 'Fetching Pokémon data…',
+    error: '',
+  };
 
   return (
     <div style={{ minHeight: '100svh', display: 'flex', flexDirection: 'column', background: C.bg }}>
       {/* Header */}
       <div style={{
-        paddingTop: 54, background: C.white, borderBottom: `1px solid ${C.border}`,
+        background: C.white, borderBottom: `1px solid ${C.border}`,
         display: 'flex', alignItems: 'center', gap: 12, padding: '54px 16px 12px',
       }}>
         <button onClick={onBack} disabled={busy} style={{
@@ -75,11 +117,10 @@ export function PhotoScreen({ onBack, onResult }: Props) {
       </div>
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '24px 20px', gap: 16 }}>
-        {/* Preview / placeholder */}
+        {/* Preview */}
         <div style={{
           borderRadius: 20, overflow: 'hidden',
-          background: '#F1ECE8',
-          border: `2px dashed ${C.border}`,
+          background: '#F1ECE8', border: `2px dashed ${C.border}`,
           aspectRatio: '1',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           position: 'relative',
@@ -91,23 +132,19 @@ export function PhotoScreen({ onBack, onResult }: Props) {
             <div style={{ textAlign: 'center', color: C.inkSoft, padding: 32 }}>
               <div style={{ marginBottom: 12, opacity: 0.4 }}><IconCamera /></div>
               <div style={{ fontSize: 15, fontWeight: 600 }}>No photo selected</div>
-              <div style={{ fontSize: 13, marginTop: 4 }}>Tap the button below to take or upload a photo</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>Tap below to take a photo or pick one from your gallery</div>
             </div>
           )}
 
-          {/* Overlay while analyzing */}
           {busy && (
             <div style={{
-              position: 'absolute', inset: 0,
-              background: 'rgba(0,0,0,0.55)',
+              position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.6)',
               display: 'flex', flexDirection: 'column',
               alignItems: 'center', justifyContent: 'center',
               color: '#fff', gap: 12,
             }}>
               <Spinner />
-              <div style={{ fontSize: 15, fontWeight: 600 }}>
-                {status === 'analyzing' ? 'Analyzing image…' : 'Fetching Pokémon data…'}
-              </div>
+              <div style={{ fontSize: 15, fontWeight: 600 }}>{statusLabel[status]}</div>
             </div>
           )}
         </div>
@@ -119,12 +156,11 @@ export function PhotoScreen({ onBack, onResult }: Props) {
           </div>
         )}
 
-        {/* Hidden file input */}
+        {/* File input — no capture attr so users can pick camera OR gallery */}
         <input
           ref={inputRef}
           type="file"
           accept="image/*"
-          capture="environment"
           style={{ display: 'none' }}
           onChange={(e) => {
             const file = e.target.files?.[0];
@@ -133,14 +169,12 @@ export function PhotoScreen({ onBack, onResult }: Props) {
           }}
         />
 
-        {/* Upload button */}
         <button
           disabled={busy}
           onClick={() => inputRef.current?.click()}
           style={{
             all: 'unset', cursor: busy ? 'default' : 'pointer',
-            background: busy ? '#E8E5E3' : C.red,
-            color: '#fff',
+            background: busy ? '#E8E5E3' : C.red, color: '#fff',
             padding: '16px', borderRadius: 16,
             fontSize: 16, fontWeight: 700, textAlign: 'center',
             boxShadow: busy ? 'none' : '0 6px 18px rgba(230,57,70,0.32)',
@@ -152,7 +186,7 @@ export function PhotoScreen({ onBack, onResult }: Props) {
 
         <div style={{ fontSize: 13, color: C.inkSoft, textAlign: 'center', lineHeight: 1.5 }}>
           Works best with official artwork, card scans, or clear in-game screenshots.
-          Claude Vision identifies the Pokémon — no account required.
+          Gemini Vision identifies the Pokémon.
         </div>
       </div>
     </div>
